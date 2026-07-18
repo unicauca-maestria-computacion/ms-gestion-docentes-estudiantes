@@ -17,5 +17,5 @@ jobs:
           cd /home/daniel/practica-profesional
           docker compose pull ms-gestion-docentes-estudiantes
           docker compose up -d ms-gestion-docentes-estudiantes
-          docker image prune -f
+          docker images --filter "dangling=true" --filter "reference=*practica-profesional-gestion-docentes-estudiantes*" -q | xargs -r docker rmi -f 2>/dev/null || true
 
