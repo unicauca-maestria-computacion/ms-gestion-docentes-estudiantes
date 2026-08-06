@@ -2,7 +2,7 @@ name: CI Practica Profesional ms-gestion-docentes-estudiantes
 
 on:
   push:
-    branches: ['master']
+    branches: ['despliegue-de-pruebas']
 
 jobs:
   build:
