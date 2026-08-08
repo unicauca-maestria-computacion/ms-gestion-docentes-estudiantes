@@ -39,3 +39,190 @@ jobs:
             .
           docker push $DOCKER_USERNAME/practica-profesional-gestion-docentes-estudiantes:$TAG
           docker push $DOCKER_USERNAME/practica-profesional-gestion-docentes-estudiantes:latest
+
+  deploy:
+    runs-on: self-hosted
+    needs: build
+    env:
+      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+      BD_USER: ${{ secrets.BD_USER }}
+      BD_PASSWORD: ${{ secrets.BD_PASSWORD }}
+
+    steps:
+      - name: Acquire exclusive deploy lock (avoid overwhelming the shared host)
+        run: |
+          LOCK_DIR="/tmp/practica-u-deploy.lock"
+          MAX_WAIT=2400
+          MAX_LOCK_AGE=1800
+          waited=0
+          while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+            lock_age=$(( $(date +%s) - $(stat -c %Y "$LOCK_DIR" 2>/dev/null || date +%s) ))
+            if [ "$lock_age" -gt "$MAX_LOCK_AGE" ]; then
+              echo "Lock abandonado hace ${lock_age}s (el dueno probablemente murio) -- liberando y tomando control"
+              rm -rf "$LOCK_DIR"
+              continue
+            fi
+            if [ "$waited" -ge "$MAX_WAIT" ]; then
+              echo "Timeout esperando el lock de deploy compartido"
+              exit 1
+            fi
+            echo "Otro deploy de practica-u esta en curso, esperando... (${waited}s/${MAX_WAIT}s)"
+            sleep 10
+            waited=$((waited + 10))
+          done
+          echo "${{ github.repository }}" > "$LOCK_DIR/owner"
+          echo "Lock de deploy adquirido"
+
+      - name: Create Docker Network
+        run: |
+          docker network create --driver bridge --opt com.docker.network.driver.mtu=1400 maestria-network || echo "Network already exists"
+
+      - name: Ensure Eureka Discovery Server is Running (directory)
+        run: |
+          echo "Ensuring Eureka Discovery Server is running (retry up to 5 times)..."
+          for attempt in 1 2 3 4 5; do
+            if docker ps -q --filter name=directory-service; then
+              echo "Eureka Discovery Server is already running (found on attempt $attempt)."
+              break
+            fi
+            echo "Eureka not running, attempt $attempt/5..."
+            if [ -z "$(docker ps -a -q -f name=directory-service)" ]; then
+              echo "Creating directory-service container..."
+              docker run -d \
+                --name "directory-service" \
+                --network "maestria-network" \
+                --network-alias "directory" \
+                -p 8765:8761 \
+                --restart "always" \
+                --cpus "0.5" \
+                --memory "256m" \
+                --memory-swap "256m" \
+                --label project="practica-u" \
+                --label service="directory" \
+                -e JAVA_TOOL_OPTIONS="-Dfile.encoding=UTF-8 -XX:+UseSerialGC -Xms64m -Xmx192m" \
+                $DOCKER_USERNAME/practica-profesional-directory:latest
+            else
+              echo "Starting existing directory-service container..."
+              docker start directory-service 2>/dev/null || true
+            fi
+            if [ $attempt -lt 5 ]; then
+              echo "Waiting 6s before next attempt..."
+              sleep 6
+            fi
+          done
+          if ! docker ps -q --filter name=directory-service; then
+            echo "ERROR: Eureka Discovery Server failed to start after 5 attempts."
+            exit 1
+          fi
+          echo "Eureka Discovery Server is ready."
+
+      - name: Ensure MySQL Database Container is Running
+        run: |
+          if [ -z "$(docker ps -a -q -f name=mysql-db)" ]; then
+            echo "Creating and starting mysql-db container..."
+            docker run -d \
+              --name "mysql-db" \
+              --network "maestria-network" \
+              -p 3307:3306 \
+              --restart "always" \
+              --cpus "0.75" \
+              --memory "512m" \
+              --memory-swap "1g" \
+              -e MYSQL_ROOT_PASSWORD="$BD_PASSWORD" \
+              -e MYSQL_DATABASE="maestria-computacion" \
+              -v mysql_maestria_data:/var/lib/mysql \
+              mysql:8.0 \
+                --character-set-server=utf8mb4 \
+                --collation-server=utf8mb4_unicode_ci \
+                --innodb_buffer_pool_size=128M \
+                --innodb_log_buffer_size=4M \
+                --max-allowed-packet=128M \
+                --skip-name-resolve \
+                --performance_schema=OFF \
+                --innodb_buffer_pool_instances=1 \
+                --max_connections=64 \
+                --skip-mysqlx
+          else
+            echo "mysql-db container exists, ensuring it is started..."
+            docker start mysql-db
+          fi
+
+      - name: Infrastructure Diagnosis & Cleanup
+        run: |
+          echo "--- DISK SPACE CHECK ---"
+          df -h || true
+          echo "--- CLEANING OLD CONTAINER ---"
+          docker rm -f gestion-docentes-estudiantes-service || true
+
+      - name: Pull Application Image (with Retry Logic)
+        run: |
+          echo "Attempting to pull image with auto-retry for stability..."
+          for i in 1 2 3; do
+            docker pull $DOCKER_USERNAME/practica-profesional-gestion-docentes-estudiantes:latest && exit 0 || \
+            (echo "Attempt $i failed, waiting 10s..." && sleep 10)
+          done
+          echo "All pull attempts failed."
+          exit 1
+
+      - name: Run Application Container
+        run: |
+          docker run -d \
+            --name "gestion-docentes-estudiantes-service" \
+            --network "maestria-network" \
+            --network-alias "gestion-docentes-estudiantes-service" \
+            --network-alias "gestion-docentes-estudiantes" \
+            --restart "always" \
+            --cpus "0.3" \
+            --memory "256m" \
+            --memory-swap "256m" \
+            --label project="practica-u" \
+            --label service="gestion-docentes-estudiantes" \
+            -e SPRING_PROFILES_ACTIVE="dev" \
+            -e EUREKA_CLIENT_SERVICE_URL_DEFAULTZONE="http://directory:8761/eureka/" \
+            -e EUREKA_CLIENT_SERVICEURL_DEFAULTZONE="http://directory:8761/eureka/" \
+            -e SPRING_DATASOURCE_URL="jdbc:mysql://mysql-db:3306/maestria-computacion?useUnicode=true&characterEncoding=UTF-8&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=America/Bogota" \
+            -e SPRING_DATASOURCE_USERNAME="$BD_USER" \
+            -e SPRING_DATASOURCE_PASSWORD="$BD_PASSWORD" \
+            -e JAVA_TOOL_OPTIONS="-Dfile.encoding=UTF-8 -XX:+UseSerialGC -Xms32m -Xmx176m" \
+            $DOCKER_USERNAME/practica-profesional-gestion-docentes-estudiantes:latest
+
+      - name: Clean Old Images of This Service
+        run: |
+          echo "Cleaning old images for gestion-docentes-estudiantes service..."
+          # Remove stopped containers first
+          docker ps -a --filter "label=service=gestion-docentes-estudiantes" --filter "status=exited" -q | xargs -r docker rm 2>/dev/null || true
+          # Prune dangling images (catches <none>:<none> orphans)
+          echo 'Removing dangling images for this service...'
+          docker images --filter 'dangling=true' --filter 'label=service=gestion-docentes-estudiantes' -q | xargs -r docker rmi -f 2>/dev/null || true
+          # Remove old tagged images (keep only latest)
+          CURRENT_IMAGE=$(docker inspect gestion-docentes-estudiantes-service --format='{{.Image}}' 2>/dev/null || echo "")
+          if [ -n "$CURRENT_IMAGE" ]; then
+            CURRENT_SHORT="${CURRENT_IMAGE:7:12}"
+            docker images $DOCKER_USERNAME/practica-profesional-gestion-docentes-estudiantes --format "{{.ID}} {{.Tag}}" | while read img_id tag; do
+              if [ "$tag" != "latest" ] && [ "${img_id:0:12}" != "$CURRENT_SHORT" ]; then
+                echo "Removing old tagged image: $img_id ($tag)"
+                docker rmi -f "$img_id" 2>/dev/null || true
+              fi
+            done
+          fi
+
+      - name: Clean Docker Build Cache
+        if: always()
+        run: |
+          echo "Cleaning Docker build cache older than 7 days..."
+          docker builder prune --filter "until=168h" -f || true
+
+      - name: Final Status Check
+        run: |
+          sleep 15
+          docker ps | grep gestion-docentes-estudiantes-service || true
+          echo "--- LAST 100 LINES OF LOGS ---"
+          docker logs --tail 100 gestion-docentes-estudiantes-service || true
+
+      - name: Release exclusive deploy lock
+        if: always()
+        run: |
+          LOCK_DIR="/tmp/practica-u-deploy.lock"
+          if [ -f "$LOCK_DIR/owner" ] && [ "$(cat "$LOCK_DIR/owner")" = "${{ github.repository }}" ]; then
+            rm -rf "$LOCK_DIR"
+          fi
